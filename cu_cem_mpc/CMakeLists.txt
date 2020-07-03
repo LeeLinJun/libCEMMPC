@@ -6,7 +6,11 @@ include_directories(
     ./include
 )
 
-set(CARTPOLE_SRC src/cartpole/cartpole.cu src/acrobot/acrobot.cu src/main.cpp)
+set(CARTPOLE_SRC
+    src/cartpole/cartpole.cu
+    src/cartpole/cartpole_parallel.cu
+    src/acrobot/acrobot.cu
+    src/main.cpp)
 
 add_executable(demo ${CARTPOLE_SRC})
 # add_executable(cartpole_diff ${CARTPOLE_DIFF_SRC})
