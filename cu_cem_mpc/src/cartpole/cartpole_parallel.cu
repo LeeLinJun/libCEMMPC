@@ -1,5 +1,4 @@
 #include "cartpole/cartpole_parallel.h"
-#include "cuda_dep.h"
 
 #define I 10
 #define L 2.5
@@ -10,6 +9,7 @@
 
 #define DT  2e-3
 #define MAX_T 0.2
+
 #define PI  3.141592654f
 
 #define MIN_X -30
@@ -33,11 +33,16 @@
 
 namespace cartpole_parallel {
 
+    __global__ void initCurand(curandState* state, unsigned long seed) {
+        int idx = threadIdx.x + blockIdx.x * blockDim.x;
+        curand_init(seed, idx, 0, &state[idx]);
+    }
+
     __global__ 
     void set_statistics(double* d_mean_time, const double mean_time, double* d_mean_control, const double mean_control, 
         double* d_std_control, const double std_control, double* d_std_time, const double std_time, int NT){
         unsigned int np = blockIdx.x * blockDim.x + threadIdx.x;
-        unsigned int nt = blockIdx.y * blockDim.y + threadIdx.y;
+        unsigned int nt = blockIdx.z * blockDim.z + threadIdx.z;
         unsigned int id = np * NT + nt;
         //unsigned int id = blockIdx.x*blockDim.x + threadIdx.x;// 0~NT * NP
         d_mean_time[id] = mean_time;
@@ -62,16 +67,18 @@ namespace cartpole_parallel {
     }
 
     __global__ 
-    void sampling(double* control, double* time, double* mean_control, double* mean_time, double* std_control, double* std_time, const int NP, const int NS, const int NT, bool* active_mask){
-        //unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;// each sample
+    void sampling(double* control, double* time, double* mean_control, double* mean_time, double* std_control, double* std_time, const int NP, const int NS, const int NT, bool* active_mask,
+        curandState* state){
         unsigned int np = blockIdx.x * blockDim.x + threadIdx.x;
         unsigned int ns = blockIdx.y * blockDim.y + threadIdx.y;
         unsigned int nt = blockIdx.z * blockDim.z + threadIdx.z;
-        curandState state;
-        curand_init(clock(), np, 0, &state);
+        unsigned int id = np * NS * NT + ns * NT + nt;
+
+        //printf("%d, %d, %d\n",np, ns, nt);
+
         active_mask[np * NS + ns] = true;
 
-        double c = std_control[np * NT + nt] * curand_normal(&state) + mean_control[np * NT + nt];
+        double c = std_control[np * NT + nt] * curand_normal(&state[id]) + mean_control[np * NT + nt];
         if (c > MAX_TORQE) {
             c = MAX_TORQE;
         }
@@ -79,15 +86,15 @@ namespace cartpole_parallel {
             c = MIN_TORQE;
         }
         control[np * NS * NT + ns * NT + nt] = c;
-        // curand_init(clock(), id + t, 0, &state);
-        double t = std_time[np * NT + nt] * curand_normal(&state) + mean_time[np * NT + nt];
-        // printf("%f, %f\n",control[t * NS + id],time[t * NS + id]);
+        double t = std_time[np * NT + nt] * curand_normal(&state[id]) + mean_time[np * NT + nt];
         if(t < DT){
             t = 0;
         } else if (t > MAX_T) {
             t = MAX_T;
         }
-        time[np * NS * NT + ns * NT + nt] = t;        
+        time[np * NS * NT + ns * NT + nt] = t;      
+        //printf("%f, %f\n", c, t);
+
     }
 
     __device__
@@ -154,6 +161,7 @@ namespace cartpole_parallel {
             unsigned int np = blockIdx.x * blockDim.x + threadIdx.x;
             unsigned int ns = blockIdx.y * blockDim.y + threadIdx.y;
             unsigned int id = np * NS + ns;
+            //printf("%d, %d, %d, %d\n", blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y);
             //unsigned int id = blockIdx.x*blockDim.x + threadIdx.x;
                 //printf("%d\n", id);
 
@@ -161,7 +169,7 @@ namespace cartpole_parallel {
             if (t < 0){
                 t = 0;
             }
-            int num_step = (t + 0.1 * DT) / DT;
+            int num_step = t / DT;
             double _a = control[np * NS * NT + ns * NT + t_step];
                 
             for(unsigned int i = 0; i < num_step; i++){
@@ -202,7 +210,7 @@ namespace cartpole_parallel {
                 bool valid = valid_state(&temp_state[id*DIM_STATE], obs_list);
                 active_mask[id] = active_mask[id] && valid;
             }        
-            printf("%d, %d: %f, %f, %f, %f\n", ns, np, temp_state[id * DIM_STATE + STATE_X], temp_state[id * DIM_STATE + STATE_V], temp_state[id * DIM_STATE + STATE_THETA], temp_state[id * DIM_STATE + STATE_W]);
+           // printf("%d, %d: %f, %f, %f, %f\n", ns, np, temp_state[id * DIM_STATE + STATE_X], temp_state[id * DIM_STATE + STATE_V], temp_state[id * DIM_STATE + STATE_THETA], temp_state[id * DIM_STATE + STATE_W]);
 
     }
 
@@ -213,22 +221,26 @@ namespace cartpole_parallel {
         unsigned int ns = blockIdx.y * blockDim.y + threadIdx.y;
         unsigned int id = np * NS + ns;
 
-        loss[id] = sqrt((temp_state[id * DIM_STATE + STATE_X] - goal_state[id * DIM_STATE + STATE_X]) * (temp_state[id * DIM_STATE + STATE_X] - goal_state[id * DIM_STATE + STATE_X])\
-            + 0.5 * (temp_state[id * DIM_STATE + STATE_V] - goal_state[id * DIM_STATE + STATE_V]) * (temp_state[id * DIM_STATE + STATE_V] - goal_state[id * DIM_STATE + STATE_V])\
-            + (temp_state[id * DIM_STATE + STATE_THETA] - goal_state[id * DIM_STATE + STATE_THETA]) * (temp_state[id * DIM_STATE + STATE_THETA] - goal_state[id * DIM_STATE + STATE_THETA])\
-            + 0.5 * (temp_state[id * DIM_STATE + STATE_W] - goal_state[id * DIM_STATE + STATE_W]) * (temp_state[id * DIM_STATE + STATE_W] - goal_state[id * DIM_STATE + STATE_W]));
+        loss[id] = sqrt((temp_state[id * DIM_STATE + STATE_X] - goal_state[np * DIM_STATE + STATE_X]) * (temp_state[id * DIM_STATE + STATE_X] - goal_state[np * DIM_STATE + STATE_X])\
+            + 0.5 * (temp_state[id * DIM_STATE + STATE_V] - goal_state[np * DIM_STATE + STATE_V]) * (temp_state[id * DIM_STATE + STATE_V] - goal_state[np * DIM_STATE + STATE_V])\
+            + (temp_state[id * DIM_STATE + STATE_THETA] - goal_state[np * DIM_STATE + STATE_THETA]) * (temp_state[id * DIM_STATE + STATE_THETA] - goal_state[np * DIM_STATE + STATE_THETA])\
+            + 0.5 * (temp_state[id * DIM_STATE + STATE_W] - goal_state[np * DIM_STATE + STATE_W]) * (temp_state[id * DIM_STATE + STATE_W] - goal_state[np * DIM_STATE + STATE_W]));
 
-        //printf("%d, %d: %f, %f, %f, %f\n", ns, np, temp_state[id * DIM_STATE + STATE_X], temp_state[id * DIM_STATE + STATE_V], temp_state[id * DIM_STATE + STATE_THETA], temp_state[id * DIM_STATE + STATE_W]);
         if (!active_mask[id]) {
             loss[id] += OBS_PENALTY;
-        }        
+        }
+        /*printf("%d, %d: %f, %f, %f, %f, loss: %f\n", 
+            ns, np, 
+            temp_state[id * DIM_STATE + STATE_X], temp_state[id * DIM_STATE + STATE_V], temp_state[id * DIM_STATE + STATE_THETA], temp_state[id * DIM_STATE + STATE_W],
+            loss[id]);*/
+
     }
 
     __global__
     void update_statistics(double* control, double* time, double* mean_control, double* mean_time, double* std_control, double* std_time,
         int* loss_ind, double* loss, int NP, int NS, int NT, int N_ELITE, double* best_ut){
         unsigned int np = blockIdx.x * blockDim.x + threadIdx.x;
-        unsigned int nt = blockIdx.y * blockDim.y + threadIdx.y;
+        unsigned int nt = blockIdx.z * blockDim.z + threadIdx.z;
 
         //unsigned int id = blockIdx.x*blockDim.x + threadIdx.x;
         double sum_control = 0., sum_time = 0., ss_control = 0., ss_time = 0.;
@@ -248,8 +260,6 @@ namespace cartpole_parallel {
         
         best_ut[s_id] = control[np * NS * NT + loss_ind[np * NS] * NT + nt];
         best_ut[s_id + NP * NT] = time[np * NS * NT + loss_ind[np * NS] * NT + nt];
-            
-        
     }
     
    /* __global__ void parallel_sort(thrust::device_ptr<int> loss_ind_ptr, thrust::device_ptr<double> loss_ptr, int NS) {
@@ -261,8 +271,8 @@ namespace cartpole_parallel {
 
  
 
-    CartpoleParallel::CartpoleParallel(int np, int ns, int n_elete, int nt,  int max_it, int block_size, std::vector<std::vector<double>>& _obs_list, double width)
-        : NP(np), NS(ns), N_ELITE(n_elete), NT(nt), max_it(max_it), BLOCK_SIZE(block_size){
+    CartpoleParallel::CartpoleParallel(int np, int ns, int n_elete, int nt,  int max_it, std::vector<std::vector<double>>& _obs_list, double width)
+        : NP(np), NS(ns), N_ELITE(n_elete), NT(nt), max_it(max_it){
         printf("setup...\n");
         // control and time matrix
         best_ut = (double*) malloc(NP * NT * /*time + control*/2 * sizeof(double));
@@ -310,6 +320,10 @@ namespace cartpole_parallel {
         cudaMalloc(&d_start_state, NP * DIM_STATE * sizeof(double));
         cudaMalloc(&d_goal_state, NP * DIM_STATE * sizeof(double));
 
+        // initiate curand
+        cudaMalloc((void**)&devState, np * ns * nt * sizeof(curandState));
+        initCurand << <(np * ns * nt + 31) / 32, 32 >> > (devState, 42);
+        
         printf("done, execution:\n");
 
     }
@@ -322,16 +336,17 @@ namespace cartpole_parallel {
         //thrust::device_ptr<double> time_ptr(d_time);
         //thrust::device_ptr<double> control_ptr(d_control);
 
-        dim3 grid(1, 1, 1);
-        dim3 block_3d(NP, NS, NT);
-        dim3 block_2d(NP, NS, 1);
-        dim3 block_2d_pt(NP, NT, 1);
 
+        dim3 grid(1, 1, 1);
+        dim3 grid_s(1, NS, 1);
+
+        dim3 block_pt(NP, 1, NT);
+        dim3 block_p(NP, 1, 1);
 
         thrust::device_ptr<double> loss_ptr(d_loss);
         thrust::device_ptr<int> loss_ind_ptr(d_loss_ind);
         //init mean
-        set_statistics<<<grid, block_2d_pt>>>(d_mean_time, 0, d_mean_control, 0.0, d_std_control, 300, d_std_time, 5e-2, NT);
+        set_statistics<<<grid, block_pt>>>(d_mean_time, 0., d_mean_control, 0.0, d_std_control, 300, d_std_time, 5e-2, NT);
 
         double min_loss = 1e5;
         double tmp_min_loss = 2e5;
@@ -340,18 +355,15 @@ namespace cartpole_parallel {
        
 
         for(unsigned int it = 0; it < max_it; it ++){
-            set_start_state<<<grid, block_2d>>>(d_temp_state, d_start_state, NS);
+            set_start_state<<<grid_s, block_p>>>(d_temp_state, d_start_state, NS);
 
-            //sampling<<<(NP * NS+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(d_control, d_time, d_mean_control, d_mean_time, d_std_control, d_std_time, NP * NS, NT, d_active_mask);
-
-            
-            sampling << <grid, block_3d >> > (d_control, d_time, d_mean_control, d_mean_time, d_std_control, d_std_time, NP, NS, NT, d_active_mask);
+            sampling << <grid_s, block_pt >> > (d_control, d_time, d_mean_control, d_mean_time, d_std_control, d_std_time, NP, NS, NT, d_active_mask, devState);
 
             for(unsigned int t_step = 0; t_step < NT; t_step++){
-                propagate<<<grid, block_2d >>>(d_temp_state, d_control, d_time, d_deriv, t_step, NS, NT, d_active_mask, d_obs_list);
+                propagate<<<grid_s, block_p >>>(d_temp_state, d_control, d_time, d_deriv, t_step, NS, NT, d_active_mask, d_obs_list);
             }
             //std::cout<< "propagation" <<std::endl;
-            get_loss<<< grid, block_2d >>>(d_temp_state, d_loss, NS, d_goal_state, d_active_mask);
+            get_loss<<< grid_s, block_p >>>(d_temp_state, d_loss, NS, d_goal_state, d_active_mask);
             
             //std::cout<< "get_loss" <<std::endl;
             // Continue from here
@@ -361,11 +373,11 @@ namespace cartpole_parallel {
 
                 thrust::sequence(loss_ind_ptr + NS * p, loss_ind_ptr + NS * p + NS);
 
-                std::cout << "p=" << p << std::endl;
+                /*std::cout << "p=" << p << std::endl;
                 thrust::copy(loss_ind_ptr + NS * p, loss_ind_ptr + NS * p + NS, std::ostream_iterator<int>(std::cout, "\t"));
                 std::cout << std::endl;
                 thrust::copy(loss_ptr + NS * p, loss_ptr + NS * p + NS, std::ostream_iterator<double>(std::cout, "\t"));
-                
+                */
                 thrust::sort_by_key(loss_ptr + NS * p, loss_ptr + NS * p + NS, loss_ind_ptr + NS * p);
 
                /* std::cout << "p=" << p << std::endl;
@@ -376,24 +388,21 @@ namespace cartpole_parallel {
            /* std::cout << std::endl;
 
             thrust::copy(loss_ptr, loss_ptr + NS * NP, std::ostream_iterator<double>(std::cout, "\t"));*/
-
-           
-            //std::cout<< "sort" <<std::endl;
-            update_statistics<<<grid, block_2d_pt >>>(d_control, d_time, d_mean_control, d_mean_time, d_std_control, d_std_time,
+            update_statistics<<<grid, block_pt >>>(d_control, d_time, d_mean_control, d_mean_time, d_std_control, d_std_time,
                 thrust::raw_pointer_cast(loss_ind_ptr),  thrust::raw_pointer_cast(loss_ptr), NP, NS, NT, N_ELITE, d_best_ut);
             //std::cout<< "update" <<std::endl;
             for (unsigned int p = 0; p < NP; p++) {
                 cudaMemcpy(&tmp_min_loss, thrust::raw_pointer_cast(loss_ptr + NS * p), sizeof(double), cudaMemcpyDeviceToHost);
 
-                if (tmp_min_loss < min_loss) {
+                /*if (tmp_min_loss < min_loss) {
                     min_loss = tmp_min_loss;
                     cudaMemcpy(best_ut, d_best_ut, 2 * NT * sizeof(double), cudaMemcpyDeviceToHost);
+                }*/
+                printf("p=%d, %f,\t%f\n", p, tmp_min_loss, min_loss);
+                //thrust::copy(loss_ptr + NS * p, loss_ptr + NS * p + NS, std::ostream_iterator<double>(std::cout, "\t"));
 
-                }
-                printf("%f,\t%f\n", tmp_min_loss, min_loss);
             }
-
-            return;
+            printf("\n");
 
             /*if(min_loss < 1e-1){
                 break;

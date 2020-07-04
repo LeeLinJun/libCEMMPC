@@ -2,6 +2,8 @@
 #include <chrono>   
 #include <stdio.h>
 #include <vector>
+#include "cuda_dep.h"
+
 // #include "cartpole_cu.h"
 
 namespace cartpole_parallel{
@@ -14,9 +16,11 @@ namespace cartpole_parallel{
             int NT;
             int max_it;
             // Cartpole();
-            CartpoleParallel(int NP, int NS, int N_ELITE, int NT, int max_it, int BLOCK_SIZE, std::vector<std::vector<double>>& _obs_list, double width);
+            CartpoleParallel(int NP, int NS, int N_ELITE, int NT, int max_it, std::vector<std::vector<double>>& _obs_list, double width);
             ~CartpoleParallel();
             void cem(double* start, double* goal);
+            curandState* devState;
+
 
             // double* cem(double* start, double* goal);
         protected:
